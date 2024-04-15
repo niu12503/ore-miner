@@ -22,28 +22,12 @@ use tokio::sync::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{
-    constant,
-    format_duration,
-    format_reward,
-    jito,
-    jito::{subscribe_jito_tips, JitoTips},
-    utils,
-    wait_return,
-    Miner,
-};
+use crate::{constant, format_duration, format_reward, utils, Miner};
 
 #[derive(Debug, Clone, Parser)]
 pub struct BundleMineGpuArgs {
     #[arg(long, help = "The folder that contains all the keys used to claim $ORE")]
     pub key_folder: String,
-
-    #[arg(
-        long,
-        default_value = "0",
-        help = "The maximum tip to pay for jito. Set to 0 to disable adaptive tip"
-    )]
-    pub max_adaptive_tip: u64,
 
     #[arg(long, default_value = "2", help = "The maximum number of buses to use for mining")]
     pub max_buses: usize,
@@ -71,7 +55,8 @@ impl Miner {
         let idle_accounts_counter = Arc::new(AtomicUsize::new(all_signers.len()));
 
         // Setup channels
-        let (ch_accounts, mut ch_accounts_receiver) = channel::<Accounts>(all_signers.len() / Accounts::size());
+        let (ch_accounts, mut ch_accounts_receiver) =
+            channel::<Accounts>(all_signers.len() / Accounts::size());
 
         let batches = all_signers
             .into_iter()
@@ -84,10 +69,6 @@ impl Miner {
                 Accounts {
                     id: i,
                     pubkey: signers.iter().map(|k| k.pubkey()).collect(),
-                    proof_pda: signers
-                        .iter()
-                        .map(|k| utils::get_proof_pda_no_cache(k.pubkey()))
-                        .collect(),
                     signers,
                     release_stuff: (ch_accounts.clone(), idle_accounts_counter.clone()),
                 }
@@ -99,11 +80,6 @@ impl Miner {
         }
 
         info!("splitted signers into batches");
-
-        // Subscribe tip stream
-        let tips = Arc::new(RwLock::new(JitoTips::default()));
-        subscribe_jito_tips(tips.clone()).await;
-        info!("subscribed to jito tip stream");
 
         loop {
             let mut batch = Vec::new();
@@ -122,12 +98,12 @@ impl Miner {
             }
 
             let idle_accounts = idle_accounts_counter
-                .fetch_sub(batch.len() * Accounts::size(), std::sync::atomic::Ordering::Relaxed) -
-                batch.len() * Accounts::size();
+                .fetch_sub(batch.len() * Accounts::size(), std::sync::atomic::Ordering::Relaxed)
+                - batch.len() * Accounts::size();
 
             loop {
                 let result = self
-                    .mine_with_accounts(args, client.clone(), tips.clone(), batch, idle_accounts)
+                    .mine_with_accounts(args, client.clone(), batch.clone(), idle_accounts)
                     .await;
 
                 batch = match result {
@@ -142,7 +118,6 @@ impl Miner {
         &self,
         args: &BundleMineGpuArgs,
         client: Arc<RpcClient>,
-        tips: Arc<RwLock<JitoTips>>,
         batch: Vec<Accounts>,
         idle_accounts: usize,
     ) -> Option<Vec<Accounts>> {
@@ -159,11 +134,6 @@ impl Miner {
             .flat_map(|accounts| accounts.pubkey.clone())
             .collect::<Vec<_>>();
 
-        let proof_pda = batch
-            .iter()
-            .flat_map(|accounts| accounts.proof_pda.clone())
-            .collect::<Vec<_>>();
-
         let signer_balances = match Self::get_balances(&client, &all_pubkey).await {
             Ok(b) => b,
             Err(err) => {
@@ -172,49 +142,23 @@ impl Miner {
             }
         };
 
-        let proofs = match Self::get_proof_accounts(&client, &proof_pda).await {
-            Ok(proofs) => proofs,
-            Err(err) => {
-                error!("fail to fetch proof accounts: {err:#}");
-                wait_return!(500, Some(batch));
-            }
-        };
-
         let reset_threshold = treasury.last_reset_at.saturating_add(ore::EPOCH_DURATION);
-        let time_to_next_epoch = Self::get_time_to_next_epoch(&treasury, &clock, reset_threshold);
+        let time_to_next_epoch =
+            Self::get_time_to_next_epoch(&treasury, &clock, reset_threshold);
 
-        let hash_and_pubkey = all_pubkey
-            .iter()
-            .zip(proofs.iter())
-            .map(|(signer, proof)| (solana_sdk::keccak::Hash::new_from_array(proof.hash.0), *signer))
-            .collect::<Vec<_>>();
-        let (mining_duration, mining_results) = self
-            .mine_hashes_gpu(&treasury.difficulty.into(), &hash_and_pubkey)
-            .await;
-
-        if mining_duration > time_to_next_epoch {
-            warn!("mining took too long, waiting for next epoch");
-            wait_return!(time_to_next_epoch.as_millis() as u64, Some(batch));
-        } else {
-            info!(
-                accounts = Accounts::size() * batch.len(),
-                accounts.idle = idle_accounts,
-                mining = format_duration!(mining_duration),
-                "mining done"
-            );
-        }
-
-        let available_bus = Self::find_buses(buses, treasury.reward_rate.saturating_mul(all_pubkey.len() as u64 + 20))
-            .into_iter()
-            .take(args.max_buses)
-            .collect_vec();
+        let available_bus = Self::find_buses(
+            buses,
+            treasury.reward_rate.saturating_mul(all_pubkey.len() as u64 + 20),
+        )
+        .into_iter()
+        .take(args.max_buses)
+        .collect::<Vec<_>>();
         if available_bus.is_empty() {
             warn!("no bus available for mining, waiting for next epoch",);
             wait_return!(time_to_next_epoch.as_millis() as u64, Some(batch));
         }
 
         let rewards = treasury.reward_rate.saturating_mul(25);
-        let tip = self.priority_fee.expect("priority fee should be set");
 
         let (send_at_slot, blockhash) = match Self::get_latest_blockhash_and_slot(&client).await {
             Ok(value) => value,
@@ -226,15 +170,10 @@ impl Miner {
 
         let task = SendBundleTask {
             client,
-            tips,
             batch,
             available_bus,
             signer_balances,
-            mining_duration,
-            mining_results,
             rewards,
-            tip,
-            max_tip: args.max_adaptive_tip,
             slot: send_at_slot,
             blockhash,
         };
@@ -250,7 +189,6 @@ struct Accounts {
     #[allow(clippy::vec_box)]
     pub signers: Vec<Box<Keypair>>,
     pub pubkey: Vec<Pubkey>,
-    pub proof_pda: Vec<Pubkey>,
     release_stuff: (Sender<Accounts>, Arc<AtomicUsize>),
 }
 
@@ -277,8 +215,6 @@ impl Accounts {
         self,
         client: Arc<RpcClient>,
         signatures: Vec<Signature>,
-        tip: u64,
-        tips: Arc<RwLock<JitoTips>>,
         send_at_slot: Slot,
         sent_at_time: Instant,
         rewards: u64,
@@ -316,26 +252,17 @@ impl Accounts {
         }
 
         if !landed_tx.is_empty() {
-            let cost = 25 * constant::FEE_PER_SIGNER + tip;
-
             info!(
                 acc.id = self.id,
                 confirm = format_duration!(sent_at_time.elapsed()),
                 rewards = format_reward!(rewards),
-                cost = format_reward!(cost),
-                tip,
                 tx.first = ?landed_tx.first().unwrap(),
                 "bundle mined",
             );
         } else {
-            let tips = *tips.read().await;
-
             warn!(
                 acc.id = self.id,
                 confirm = format_duration!(sent_at_time.elapsed()),
-                tip,
-                tips.p25 = tips.p25(),
-                tips.p50 = tips.p50(),
                 "bundle dropped"
             );
         }
@@ -346,56 +273,37 @@ impl Accounts {
 
 struct SendBundleTask {
     client: Arc<RpcClient>,
-    tips: Arc<RwLock<JitoTips>>,
     batch: Vec<Accounts>,
     available_bus: Vec<Bus>,
     signer_balances: HashMap<Pubkey, u64>,
-    mining_duration: Duration,
-    mining_results: Vec<(solana_sdk::keccak::Hash, u64)>,
     rewards: u64,
-    tip: u64,
-    max_tip: u64,
-
     slot: Slot,
     blockhash: Hash,
 }
 
 impl SendBundleTask {
     async fn work(self) {
-        let tips_now = *self.tips.read().await;
-
-        let tip = if self.max_tip > 0 {
-            let p50 = tips_now.p50();
-            if p50 == 0 {
-                self.tip
-            } else {
-                let tip = p50 + 1;
-                tip.max(50000).min(self.max_tip)
-            }
-        } else {
-            self.tip
-        };
-
-        let signer_and_mining_results = self
-            .mining_results
+        let signer_and_batch = self
+            .batch
             .into_iter()
-            .chunks(Accounts::size())
-            .into_iter()
-            .map(|c| c.collect_vec())
-            .collect_vec()
-            .into_iter()
-            .zip(self.batch.into_iter())
+            .enumerate()
+            .map(|(i, accounts)| {
+                let mut mining_results = Vec::new();
+                for _ in 0..Accounts::size() {
+                    mining_results.push((solana_sdk::keccak::Hash::default(), 0));
+                }
+                (mining_results, accounts)
+            })
             .collect::<Vec<_>>();
 
         // Bundle limit
-        for (mining_results, accounts) in signer_and_mining_results {
+        for (mining_results, accounts) in signer_and_batch {
             let mut signatures = vec![];
 
-            let tipper = utils::pick_richest_account(&self.signer_balances, &accounts.pubkey);
             let material_to_build_bundle = mining_results.chunks(5).zip(accounts.signers.chunks(5));
             let send_bundle_time = Instant::now();
 
-            debug!(accounts = ?accounts.pubkey, %tipper, "building bundle");
+            debug!(accounts = ?accounts.pubkey, "building bundle");
 
             for bus in &self.available_bus {
                 let mut bundle = Vec::with_capacity(5);
@@ -411,7 +319,7 @@ impl SendBundleTask {
                     let mut ixs = Vec::with_capacity(6);
 
                     for ((hash, nonce), signer) in hash_and_nonce.iter().zip(signers.iter()) {
-                        debug!(%tipper, signer = %signer.pubkey(), "adding mine instruction");
+                        debug!(signer = %signer.pubkey(), "adding mine instruction");
 
                         ixs.push(ore::instruction::mine(
                             signer.pubkey(),
@@ -421,10 +329,6 @@ impl SendBundleTask {
                         ));
 
                         tx_signers.push(signer);
-
-                        if tipper == signer.pubkey() {
-                            ixs.push(jito::build_bribe_ix(&tipper, tip));
-                        }
                     }
 
                     let tx = Transaction::new_signed_with_payer(
@@ -439,8 +343,16 @@ impl SendBundleTask {
 
                 let sig = bundle[0].signatures[0];
 
-                match jito::send_bundle(bundle).await {
-                    Ok((_, bundle_id)) => debug!(acc.id = accounts.id, %sig, bundle = %bundle_id, "bundle sent"),
+                match client.send_and_confirm_transaction_with_spinner_and_config(
+                    &bundle,
+                    solana_client::client_error::WaitForMaxCoverage::default(),
+                    solana_client::rpc_config::RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        preflight_commitment: None,
+                        encoding: None,
+                    },
+                ) {
+                    Ok(_) => debug!(acc.id = accounts.id, %sig, "bundle sent"),
                     Err(err) => error!(acc.id = accounts.id, %sig, "fail to send bundle: {err:#}"),
                 }
 
@@ -449,21 +361,17 @@ impl SendBundleTask {
 
             info!(
                 acc.id = accounts.id,
-                mining = format_duration!(self.mining_duration),
-                tip,
-                tip.p25 = tips_now.p25(),
-                tip.p50 = tips_now.p50(),
+                mining = format_duration!(send_bundle_time.elapsed()),
                 slot = self.slot,
                 "bundles sent"
             );
 
             tokio::spawn({
                 let client = self.client.clone();
-                let tips = self.tips.clone();
 
                 async move {
                     accounts
-                        .watch_signatures(client, signatures, tip, tips, self.slot, send_bundle_time, self.rewards)
+                        .watch_signatures(client, signatures, self.slot, send_bundle_time, self.rewards)
                         .await;
                 }
             });
