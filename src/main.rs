@@ -40,7 +40,6 @@ mod bundle_mine_gpu;
 mod claim;
 mod constant;
 mod generate_wallet;
-mod jito;
 mod register;
 mod utils;
 
@@ -56,7 +55,6 @@ async fn main() {
         Command::Register(args) => miner.register(args).await,
         Command::BenchmarkRpc(args) => miner.benchmark_rpc(args).await,
         Command::BatchTransfer(args) => miner.batch_transfer(args).await,
-        Command::JitoTipStream => miner.jito_tip_stream().await,
         Command::GenerateWallet(args) => miner.generate_wallet(args),
     }
 }
@@ -80,7 +78,6 @@ pub enum Command {
     BundleMineGpu(crate::bundle_mine_gpu::BundleMineGpuArgs),
     Register(crate::register::RegisterArgs),
     BenchmarkRpc(crate::benchmark_rpc::BenchmarkRpcArgs),
-    JitoTipStream,
     GenerateWallet(crate::generate_wallet::GenerateWalletArgs),
     BatchTransfer(crate::batch_transfer::BatchTransferArgs),
 }
@@ -203,177 +200,60 @@ impl Miner {
         id: usize,
         client: &RpcClient,
         accounts: &[Pubkey],
-    ) -> Option<(Treasury, Clock, [Bus; ore::BUS_COUNT], Vec<Proof>)> {
-        let proof_count = accounts.len() - (2 + ore::BUS_COUNT);
+    ) -> Option<(Treasury, Clock, [Bus; ore::BUS_COUNT])> {
+        let now = Instant::now();
+        let mut result = None;
 
-        let accounts = match client
-            .get_multiple_accounts_with_commitment(accounts, CommitmentConfig::processed())
+        let mut account_infos = client
+            .get_multiple_accounts_with_commitment(accounts, CommitmentConfig::confirmed())
             .await
-        {
-            Ok(accounts) => accounts.value,
-            Err(err) => {
-                error!(miner = id, "failed to get proof and treasury accounts: {err}",);
-                return None;
+            .unwrap_or_else(|err| panic!("Failed to get multiple accounts: {}", err));
+
+        let clock = match Clock::from_account(&account_infos[id].1) {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+
+        let treasury = match Treasury::from_account(&account_infos[id].1) {
+            Ok(t) => t,
+            Err(_) => return None,
+        };
+
+        let mut buses = [Bus::default(); ore::BUS_COUNT];
+        for (info, account_id) in account_infos.iter_mut().zip(accounts.iter()) {
+            if let Ok(bus) = Bus::from_account(&info.1) {
+                buses[account_id.index()] = bus;
             }
-        };
-
-        let mut accounts = accounts.into_iter();
-        let treasury: Treasury = parse_account("treasury", accounts.next())?;
-        let clock: Clock = match accounts.next() {
-            Some(Some(account)) => match bincode::deserialize::<Clock>(account.data()) {
-                Ok(account) => account,
-                Err(err) => {
-                    error!(miner = id, "failed to deserialize clock account: {err:#}",);
-                    return None;
-                }
-            },
-            _ => {
-                error!(miner = id, "clock account doesn't exist");
-                return None;
-            }
-        };
-
-        let mut buses = [Bus { id: 0, rewards: 0 }; ore::BUS_COUNT];
-        let mut proofs = Vec::with_capacity(proof_count);
-
-        for bus in buses.iter_mut() {
-            *bus = parse_account("bus", accounts.next())?;
         }
 
-        for _ in 0..proof_count {
-            proofs.push(parse_account("proof", accounts.next())?);
-        }
-
-        Some((treasury, clock, buses, proofs))
+        result = Some((treasury, clock, buses));
+        log::info!("get_accounts {}ms", now.elapsed().as_millis());
+        result
     }
 
-    pub fn get_time_to_next_epoch(treasury: &Treasury, clock: &Clock, reset_threshold: i64) -> Duration {
-        Duration::from_secs(if clock.unix_timestamp < reset_threshold {
-            reset_threshold - clock.unix_timestamp
-        } else {
-            treasury.last_reset_at + ore::EPOCH_DURATION - clock.unix_timestamp
-        } as u64)
-    }
-
-    async fn get_system_accounts(client: &RpcClient) -> eyre::Result<(Treasury, Clock, [Bus; ore::BUS_COUNT])> {
-        pub const SYSTEM_ACCOUNTS: &[Pubkey] = &[
-            ore::TREASURY_ADDRESS,
-            sysvar::clock::ID,
-            ore::BUS_ADDRESSES[0],
-            ore::BUS_ADDRESSES[1],
-            ore::BUS_ADDRESSES[2],
-            ore::BUS_ADDRESSES[3],
-            ore::BUS_ADDRESSES[4],
-            ore::BUS_ADDRESSES[5],
-            ore::BUS_ADDRESSES[6],
-            ore::BUS_ADDRESSES[7],
-        ];
-
-        let accounts = match client
-            .get_multiple_accounts_with_commitment(SYSTEM_ACCOUNTS, CommitmentConfig::processed())
-            .await
-        {
-            Ok(accounts) => accounts.value,
-            Err(err) => bail!("failed to fetch accounts: {err}"),
-        };
-
-        let mut accounts = accounts.into_iter();
-        let treasury: Treasury =
-            parse_account("treasury", accounts.next()).context("failed to parse treasury account")?;
-
-        let clock: Clock = match accounts.next() {
-            Some(Some(account)) => match bincode::deserialize::<Clock>(account.data()) {
-                Ok(account) => account,
-                Err(err) => bail!("failed to deserialize clock account: {err:#}"),
-            },
-            _ => bail!("clock account doesn't exist"),
-        };
-
-        let mut buses = [Bus { id: 0, rewards: 0 }; ore::BUS_COUNT];
-        for bus in buses.iter_mut() {
-            *bus = parse_account("bus", accounts.next()).context("failed to parse bus account")?;
-        }
-
-        Ok((treasury, clock, buses))
-    }
-
-    async fn get_proof_accounts(client: &RpcClient, accounts: &[Pubkey]) -> eyre::Result<Vec<Proof>> {
-        let account_data = match client
-            .get_multiple_accounts_with_commitment(accounts, CommitmentConfig::processed())
-            .await
-        {
-            Ok(accounts) => accounts.value,
-            Err(err) => bail!("failed to get proof accounts: {err}"),
-        };
-
-        let mut proofs = vec![];
-
-        for (i, account) in account_data.into_iter().enumerate() {
-            let account = match account {
-                None => bail!("account {} not registered", accounts[i]),
-                Some(a) => a,
-            };
-
-            let proof = match Proof::try_from_bytes(account.data()) {
-                Ok(proof) => proof,
-                Err(err) => bail!("failed to deserialize proof account {}: {err:#}", accounts[i]),
-            };
-
-            proofs.push(*proof);
-        }
-
-        Ok(proofs)
-    }
-
-    pub async fn get_balances(client: &RpcClient, accounts: &[Pubkey]) -> eyre::Result<HashMap<Pubkey, u64>> {
-        let account_data = match client.get_multiple_accounts(accounts).await {
-            Ok(a) => a,
-            Err(err) => eyre::bail!("fail to get accounts: {err:#}"),
-        };
-
-        let result = account_data
-            .into_iter()
-            .zip(accounts.iter())
-            .filter(|(account, _)| account.is_some())
-            .map(|(account, pubkey)| (*pubkey, account.unwrap().lamports))
-            .collect();
-
-        Ok(result)
-    }
-
-    pub async fn get_signature_statuses(
+    pub async fn send_and_confirm_transaction(
         client: &RpcClient,
-        signatures: &[Signature],
-    ) -> eyre::Result<(Vec<Option<TransactionStatus>>, Slot)> {
-        let signatures_params = signatures.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        transaction: &solana_sdk::transaction::Transaction,
+        payer: &Keypair,
+    ) -> eyre::Result<Signature> {
+        const SEND_RETRIES: usize = 5;
+        const CONFIRM_RETRIES: usize = 5;
+        const POLL_DELAY: Duration = Duration::from_millis(10);
 
-        let (statuses, slot) = match client
-            .send::<Response<Vec<Option<TransactionStatus>>>>(
-                RpcRequest::GetSignatureStatuses,
-                json!([signatures_params]),
-            )
-            .await
-        {
-            Ok(result) => (result.value, result.context.slot),
-            Err(err) => eyre::bail!("fail to get bundle status: {err}"),
-        };
+        for _ in 0..SEND_RETRIES {
+            let signature = client.send_transaction(transaction).await?;
 
-        Ok((statuses, slot))
-    }
-}
-
-pub fn parse_account<S: AccountDeserialize + Copy>(name: &str, account: Option<Option<Account>>) -> Option<S> {
-    match account {
-        Some(Some(account)) => match S::try_from_bytes(account.data()) {
-            Ok(account) => Some(*account),
-            Err(err) => {
-                error!("failed to deserialize {name} account: {err:#}",);
-                None
+            for _ in 0..CONFIRM_RETRIES {
+                if let Some(result) = client.get_signature_status_with_commitment(&signature, CommitmentConfig::confirmed()).await? {
+                    match result {
+                        Ok(_) => return Ok(signature),
+                        Err(_) => break,
+                    }
+                }
+                tokio::time::sleep(POLL_DELAY).await;
             }
-        },
-        _ => {
-            error!("{name} account doesn't exist");
-            None
         }
+
+        bail!("send_and_confirm_transaction failed")
     }
 }
